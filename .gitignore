@@ -1,0 +1,9 @@
+.env
+data/
+.venv/
+__pycache__/
+*.pyc
+# 백업·임시 파일
+config copy.yaml
+*_old.py
+*_원본_*.py
