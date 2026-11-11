@@ -82,7 +82,7 @@ class Checker:
 
     # ------------------------------------------------------------------
     def run(self) -> list[dict]:
-        key = self.env.get("DATA_GO_KR_KEY", "e7b259da77ac176fd59f1f6d2d6f4554ae10d8b13af10f89d99d4fe217fec52f")
+        key = self.env.get("DATA_GO_KR_KEY", "")
         ex_key = self.env.get("EX_KEY", "")
         seoul_key = self.env.get("SEOUL_KEY", "")
         print(f"공공데이터포털 키: {mask(key)} / 도로공사 키: {mask(ex_key)} / 서울 열린데이터광장 키: {mask(seoul_key)}")

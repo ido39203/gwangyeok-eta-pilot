@@ -120,11 +120,11 @@ quota:
   safety_ratio: 0.95
   limits:
     gbis_busroute: 1000
-    gbis_buslocation: 1000
+    gbis_buslocation: 10000
     gbis_arrival: 1000
     gbis_station: 1000
     seoul_busroute: 1000
-    seoul_buspos: 1000
+    seoul_buspos: 10000
     seoul_arrive: 1000
     seoul_station: 1000
     tago_route: 10000
