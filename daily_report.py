@@ -17,6 +17,8 @@
      (2026-11-11 추가. data/ref의 정류소 목록이 필요하다 → check_apis.py를 한 번 실행해 두면 생긴다)
      2026-11-11 보완: 서울 isFullFlag=1을 만석으로 처리, 퇴근용 '만석 출발' 열, 정원은 차량번호별 최대값,
      시간대 표기를 06:00~09:59 / 17:00~21:59로, TAGO 결과 코드 99를 실패로 셈, TAGO 순번 지연 비율
+     2026-11-13 보완: 출근 수집을 05:30부터 하므로, 시간대 시작 30분 전 기록을 '앞 정류장' 판정에 씀
+     (집계는 06:00~09:59에 지난 정류장만). 05:30 전 기록이 없는 날은 결과가 이전과 같다
 """
 from __future__ import annotations
 
@@ -155,6 +157,7 @@ NOSTOP_WORDS = ("미정차", "(경유)", "(가상)")
 STALE_SEC = 180          # 서울 위치 자료(dataTm)가 이보다 오래되면 버린다
 NEW_TRIP_GAP_SEC = 1800  # 같은 차량이라도 이만큼 안 보이면 새 운행으로 본다
 EDGE_SEC = 300           # 시간대 첫/마지막 호출에서 이 안쪽이면 '시간대 경계에 걸린 운행'으로 본다
+LEAD_MIN = 30            # 시간대 시작 전 이만큼의 기록은 '앞 정류장' 판정에만 쓴다(2026-11-13 출근 수집 05:30 시작)
 MAX_ROWS = 8             # 노선·시간대마다 표에 보일 정류장 수
 
 
@@ -258,8 +261,11 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
         lo, hi = stops[0], stops[-1]
         nxt = min([k for k in stations if k > hi and k not in nostop] or [hi + 1])
         next_stop = {k: (stops[i + 1] if i + 1 < len(stops) else nxt) for i, k in enumerate(stops)}
-        win = [t for t in polls if t.strftime("%Y-%m-%d") == day and h0 <= t.hour < h1]
-        if not win:
+        def in_win(t, lead=0):  # 시간대 안(lead분 앞당김 허용)
+            m = t.hour * 60 + t.minute
+            return t.strftime("%Y-%m-%d") == day and h0 * 60 - lead <= m < h1 * 60
+        win = [t for t in polls if in_win(t, LEAD_MIN)]
+        if not any(in_win(t) for t in win):
             continue
         w0, w1 = min(win), max(win)
         stat = {k: Counter() for k in stops}
@@ -269,11 +275,11 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
         first_seen = Counter()
         n_trip = n_full = 0
         for L in trips:
-            seg = [o for o in L if lo - 1 <= o[1] < nxt and o[0].strftime("%Y-%m-%d") == day and h0 <= o[0].hour < h1]
-            if len(seg) < 2:
+            seg = [o for o in L if lo - 1 <= o[1] < nxt and in_win(o[0], LEAD_MIN)]
+            if len(seg) < 2 or not any(in_win(o[0]) for o in seg):
                 continue
             n_trip += 1
-            if any(o[1] >= lo and o[2] == 0 for o in seg):
+            if any(o[1] >= lo and o[2] == 0 and in_win(o[0]) for o in seg):
                 n_full += 1
             at_start = (seg[0][0] - w0).total_seconds() <= EDGE_SEC
             at_end = (w1 - seg[-1][0]).total_seconds() <= EDGE_SEC
@@ -288,6 +294,9 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
                     continue
                 if not after:
                     miss["시간대 끝까지 못 옴" if at_end else "이 정류장 전에 사라짐"] += 1
+                    continue
+                if not in_win(after[0][0]):  # 시간대 시작 전에 지난 정류장은 집계하지 않는다
+                    miss["시간대 시작 전에 통과(집계 대상 아님)"] += 1
                     continue
                 if before[-1][2] == 0:
                     arr, dep = "full", "full"
@@ -346,7 +355,7 @@ def seat_section(paths: Paths, all_recs: dict, day: str) -> list[str]:
            "승차 정류장마다 버스가 빈자리 0으로 도착한 비율(만석 도착)과 0으로 떠난 비율(만석 출발, 만석 도착 포함). "
            "만석 출발이 만석 도착보다 많은 정류장은 그 정류장에서 버스가 찬 것으로, 줄이 남았을 수 있다. "
            "같은 노선에서 기점에서 멀수록 높아지면 승차 기회 격차다. "
-           "'판정 애매'는 호출 사이(경기 2분, 서울 1분)에 버스가 찬 경우로, 몇 % 안 되면 호출 간격은 충분하다.", ""]
+           "'판정 애매'는 호출 사이(1분)에 버스가 찬 경우로, 몇 % 안 되면 호출 간격은 충분하다.", ""]
     any_route = False
     for source in ("bus_gbis", "bus_seoul"):
         if source not in all_recs:
