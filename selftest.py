@@ -20,6 +20,19 @@ import daily_report
 from common import (BASE_DIR, KST, Paths, Resp, api_message, latlon_to_grid, read_jsonl, safe_console, window_interval,
                     epoch_slot)
 
+
+def expected_slots(windows: list, times: list, offday: bool) -> tuple[int, str]:
+    """config 시간표대로라면 times 동안 몇 번 호출해야 하는지와 그때 쓰인 간격(예: '1분').
+    2026-11-14: 기대값을 config에서 계산하게 바꿈(이전에는 2분·300초를 직접 적어 두어 설정을 바꿀 때마다 어긋났다)."""
+    slots, secs = set(), set()
+    for t in times:
+        w = window_interval(windows, t, offday)
+        if w:
+            slots.add((w[0], epoch_slot(t, w[0], w[1])))
+            secs.add(w[0])
+    label = "·".join(f"{x // 60}분" if x % 60 == 0 else f"{x}초" for x in sorted(secs)) or "해당 없음"
+    return len(slots), label
+
 FAKE_KEY = "FAKEKEY_DO_NOT_STORE_1234567890"
 
 
@@ -200,14 +213,14 @@ def main() -> None:
                 col.tick()
                 ticks.append(t)
             t += timedelta(seconds=20)
-        exp_gbis = len({int(x.timestamp()) // 120 for x in ticks})
+        exp_gbis, gbis_every = expected_slots(cfg["schedules"]["bus_gbis"], ticks, False)
         exp_tago = len({int(x.timestamp()) // 60 for x in ticks})
         exp_ex = len({int(x.timestamp()) // 300 for x in ticks})
         P = Paths(base)
         day = "2026-10-07"
         recs = {j: list(read_jsonl(P.raw / j / f"{day}.jsonl")) for j in ["bus_gbis", "bus_tago", "bus_seoul", "road_ex", "weather", "seoul_link"]}
         g7770 = [r for r in recs["bus_gbis"] if r["route"] == "7770"]
-        check("GBIS 7770 호출 수 = 2분 간격 슬롯 수", len(g7770) == exp_gbis, f"{len(g7770)} vs {exp_gbis}")
+        check(f"GBIS 7770 호출 수 = {gbis_every} 간격 슬롯 수(config 기준)", len(g7770) == exp_gbis, f"{len(g7770)} vs {exp_gbis}")
         t7770 = [r for r in recs["bus_tago"] if r["route"] == "7770"]
         check("TAGO 7770 호출 수 = 1분 간격 슬롯 수", len(t7770) == exp_tago, f"{len(t7770)} vs {exp_tago}")
         check("서울 9401 호출 수 = 1분 간격 슬롯 수", len(recs["bus_seoul"]) == exp_tago, f"{len(recs['bus_seoul'])} vs {exp_tago}")
@@ -239,6 +252,10 @@ def main() -> None:
         cfg2 = dict(cfg)
         cfg2["road_ex"] = dict(cfg["road_ex"], full_dump_days=1, keep_route_nos=["0010"])
         clock.t = datetime(2026, 10, 9, 8, 0, 1, tzinfo=KST)  # 한글날(금) = 공휴일
+        hol_ticks = [clock.t, datetime(2026, 10, 9, 8, 0, 50, tzinfo=KST)]  # 아래에서 tick()을 두 번 부른 시각
+        # 가짜 API가 노선 ID를 돌려주는 노선만 수집된다(M4101은 가짜 API에 없음) → 평일에 실제로 부른 노선 수를 기준으로
+        n_gbis_routes = len({r["route"] for r in recs["bus_gbis"]})
+        hol_slots, hol_every = expected_slots(cfg["schedules"]["bus_gbis"], hol_ticks, True)
         col2 = collect.Collector(base_dir=base, http=http, clock=clock, env=env, cfg=cfg2)
         col2.tick()
         check("지난 날짜 원본 .gz 압축", (P.raw / "bus_gbis" / f"{day}.jsonl.gz").exists() and not (P.raw / "bus_gbis" / f"{day}.jsonl").exists())
@@ -250,7 +267,13 @@ def main() -> None:
         ex2 = list(read_jsonl(P.raw / "road_ex" / "2026-10-09.jsonl"))
         check("도로공사 중복 제거: 같은 stdHour는 다시 저장하지 않음", ex2[-1]["n_new"] == 0)
         g9 = list(read_jsonl(P.raw / "bus_gbis" / "2026-10-09.jsonl"))
-        check("공휴일 08:00은 주말 시간표(300초)로 GBIS 호출", len(g9) == 2)
+        check(f"공휴일 08:00은 주말 시간표({hol_every})로 GBIS 호출(노선 {n_gbis_routes}개)",
+              len(g9) == n_gbis_routes * hol_slots, f"{len(g9)} vs {n_gbis_routes * hol_slots}")
+        # 호출 수만으로는 평일 시간표와 구분이 안 될 수 있어(08:00:01·08:00:50은 1분 간격에서도 같은 칸) 실제로 쓴 간격도 본다
+        hol_iv = window_interval(cfg["schedules"]["bus_gbis"], hol_ticks[0], True)
+        used = {col2.last_slot[j.id][0] for j in col2.jobs if j.schedule == "bus_gbis" and j.id in col2.last_slot}
+        check("공휴일 GBIS 호출 간격이 config 주말 간격과 같음", hol_iv is not None and used == {hol_iv[0]},
+              f"{sorted(used)} vs {hol_iv[0] if hol_iv else None}")
 
         # 5) 한도 초과 시 멈춤
         cfg3 = dict(cfg)

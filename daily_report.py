@@ -19,6 +19,8 @@
      시간대 표기를 06:00~09:59 / 17:00~21:59로, TAGO 결과 코드 99를 실패로 셈, TAGO 순번 지연 비율
      2026-11-13 보완: 출근 수집을 05:30부터 하므로, 시간대 시작 30분 전 기록을 '앞 정류장' 판정에 씀
      (집계는 06:00~09:59에 지난 정류장만). 05:30 전 기록이 없는 날은 결과가 이전과 같다
+     2026-11-14 보완: 토·일·공휴일은 출근/퇴근 대신 방향(서울행·귀가)별로 06:00~21:59 전체와 2시간 구간을 집계
+     (공휴일은 collect.py가 저장한 data/state/holidays_YYYY.json 기준). 평일 결과는 이전과 같다
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-from common import safe_console, BASE_DIR, Paths, now_kst, read_json, read_jsonl
+from common import safe_console, BASE_DIR, Paths, now_kst, read_json, read_jsonl, is_offday
 
 BUS_FIELDS = {  # 출처별 (차량번호 필드, 정류소 순번 필드)
     "bus_gbis": ("plateNo", "stationSeq"),
@@ -153,6 +155,11 @@ SEAT_SOURCES = {  # 출처: (빈자리 필드, 정류소 순번 필드, 차량 �
     "bus_seoul": ("congetion", "sectOrd", "plainNo"),
 }
 PERIODS = [("출근", 6, 10), ("퇴근", 17, 22)]  # 시작 시 이상, 끝 시 미만
+# 토·일·공휴일: 출퇴근 구분 대신 방향별 하루 전체(06:00~21:59) + 2시간 구간 표 (2026-11-14 주말 지침)
+# 방향은 평일과 같은 승차 정류장을 쓴다: 서울행 = 회차 전·서울 밖(평일 출근 쪽), 귀가 = 회차 후·서울 안(평일 퇴근 쪽)
+OFFDAY_PERIODS = [("서울행", 6, 22), ("귀가", 6, 22)]
+OFFDAY_BIN_H = 2
+INBOUND = {"출근", "서울행"}
 NOSTOP_WORDS = ("미정차", "(경유)", "(가상)")
 STALE_SEC = 180          # 서울 위치 자료(dataTm)가 이보다 오래되면 버린다
 NEW_TRIP_GAP_SEC = 1800  # 같은 차량이라도 이만큼 안 보이면 새 운행으로 본다
@@ -243,15 +250,16 @@ def max_run(events: list, key: str) -> int:
     return mx
 
 
-def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day: str) -> list[str]:
+def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day: str,
+                     offday: bool = False) -> list[str]:
     turn, stations, nostop = ref
     lines = []
     cap_cnt = Counter(caps.values())
     lines.append(f"**{route}** — 차량 {len(caps)}대의 오늘 최대 빈자리(정원 추정): "
                  + ", ".join(f"{c}석 {n}대" for c, n in sorted(cap_cnt.items(), key=lambda x: (-x[1], -x[0]))[:4])
                  + "  ← 하루 동안 한 번도 빈 차로 잡히지 않은 차량은 실제 정원보다 작게 나온다")
-    for label, h0, h1 in PERIODS:
-        if label == "출근":
+    for label, h0, h1 in (OFFDAY_PERIODS if offday else PERIODS):
+        if label in INBOUND:
             stops = sorted(k for k, (_, seoul) in stations.items() if k < turn and not seoul and k not in nostop)
         else:
             stops = sorted(k for k, (_, seoul) in stations.items() if k >= turn and seoul and k not in nostop)
@@ -261,63 +269,72 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
         lo, hi = stops[0], stops[-1]
         nxt = min([k for k in stations if k > hi and k not in nostop] or [hi + 1])
         next_stop = {k: (stops[i + 1] if i + 1 < len(stops) else nxt) for i, k in enumerate(stops)}
-        def in_win(t, lead=0):  # 시간대 안(lead분 앞당김 허용)
-            m = t.hour * 60 + t.minute
-            return t.strftime("%Y-%m-%d") == day and h0 * 60 - lead <= m < h1 * 60
-        win = [t for t in polls if in_win(t, LEAD_MIN)]
-        if not any(in_win(t) for t in win):
-            continue
-        w0, w1 = min(win), max(win)
-        stat = {k: Counter() for k in stops}
-        ev_arr = defaultdict(list)
-        ev_dep = defaultdict(list)
-        miss = Counter()
-        first_seen = Counter()
-        n_trip = n_full = 0
-        for L in trips:
-            seg = [o for o in L if lo - 1 <= o[1] < nxt and in_win(o[0], LEAD_MIN)]
-            if len(seg) < 2 or not any(in_win(o[0]) for o in seg):
-                continue
-            n_trip += 1
-            if any(o[1] >= lo and o[2] == 0 and in_win(o[0]) for o in seg):
-                n_full += 1
-            at_start = (seg[0][0] - w0).total_seconds() <= EDGE_SEC
-            at_end = (w1 - seg[-1][0]).total_seconds() <= EDGE_SEC
-            if not at_start and seg[0][1] > stops[min(1, len(stops) - 1)]:
-                k0 = max([x for x in stops if x <= seg[0][1]] or [seg[0][1]])
-                first_seen[stations.get(k0, ("?",))[0]] += 1
-            for k in stops:
-                before = [o for o in seg if o[1] < k]
-                after = [o for o in seg if o[1] >= k]
-                if not before:
-                    miss["시간대 시작 때 이미 지남" if at_start else "이 정류장 뒤에서 처음 잡힘"] += 1
+        def judge(h0, h1):  # 시간대 [h0시, h1시) 안의 통과를 판정한다. 호출·운행이 없으면 None
+            def in_win(t, lead=0):  # 시간대 안(lead분 앞당김 허용)
+                m = t.hour * 60 + t.minute
+                return t.strftime("%Y-%m-%d") == day and h0 * 60 - lead <= m < h1 * 60
+            win = [t for t in polls if in_win(t, LEAD_MIN)]
+            if not any(in_win(t) for t in win):
+                return None
+            w0, w1 = min(win), max(win)
+            stat = {k: Counter() for k in stops}
+            ev_arr = defaultdict(list)
+            ev_dep = defaultdict(list)
+            miss = Counter()
+            first_seen = Counter()
+            n_trip = n_full = 0
+            for L in trips:
+                seg = [o for o in L if lo - 1 <= o[1] < nxt and in_win(o[0], LEAD_MIN)]
+                if len(seg) < 2 or not any(in_win(o[0]) for o in seg):
                     continue
-                if not after:
-                    miss["시간대 끝까지 못 옴" if at_end else "이 정류장 전에 사라짐"] += 1
-                    continue
-                if not in_win(after[0][0]):  # 시간대 시작 전에 지난 정류장은 집계하지 않는다
-                    miss["시간대 시작 전에 통과(집계 대상 아님)"] += 1
-                    continue
-                if before[-1][2] == 0:
-                    arr, dep = "full", "full"
-                else:
-                    arr = "ok" if after[0][2] > 0 else "amb"
-                    if any(o[2] == 0 for o in after if o[1] < next_stop[k]):
-                        dep = "full"
-                    elif any(o[2] > 0 for o in after if o[1] > k):
-                        dep = "ok"
+                n_trip += 1
+                if any(o[1] >= lo and o[2] == 0 and in_win(o[0]) for o in seg):
+                    n_full += 1
+                at_start = (seg[0][0] - w0).total_seconds() <= EDGE_SEC
+                at_end = (w1 - seg[-1][0]).total_seconds() <= EDGE_SEC
+                if not at_start and seg[0][1] > stops[min(1, len(stops) - 1)]:
+                    k0 = max([x for x in stops if x <= seg[0][1]] or [seg[0][1]])
+                    first_seen[stations.get(k0, ("?",))[0]] += 1
+                for k in stops:
+                    before = [o for o in seg if o[1] < k]
+                    after = [o for o in seg if o[1] >= k]
+                    if not before:
+                        miss["시간대 시작 때 이미 지남" if at_start else "이 정류장 뒤에서 처음 잡힘"] += 1
+                        continue
+                    if not after:
+                        miss["시간대 끝까지 못 옴" if at_end else "이 정류장 전에 사라짐"] += 1
+                        continue
+                    if not in_win(after[0][0]):  # 시간대 시작 전에 지난 정류장은 집계하지 않는다
+                        miss["시간대 시작 전에 통과(집계 대상 아님)"] += 1
+                        continue
+                    if before[-1][2] == 0:
+                        arr, dep = "full", "full"
                     else:
-                        dep = "amb"
-                stat[k]["arr_" + arr] += 1
-                stat[k]["dep_" + dep] += 1
-                ev_arr[k].append((after[0][0], arr))
-                ev_dep[k].append((after[0][0], dep))
-        if n_trip == 0:
+                        arr = "ok" if after[0][2] > 0 else "amb"
+                        if any(o[2] == 0 for o in after if o[1] < next_stop[k]):
+                            dep = "full"
+                        elif any(o[2] > 0 for o in after if o[1] > k):
+                            dep = "ok"
+                        else:
+                            dep = "amb"
+                    stat[k]["arr_" + arr] += 1
+                    stat[k]["dep_" + dep] += 1
+                    ev_arr[k].append((after[0][0], arr))
+                    ev_dep[k].append((after[0][0], dep))
+            if n_trip == 0:
+                return None
+            passes = sum(stat[k]["arr_full"] + stat[k]["arr_ok"] + stat[k]["arr_amb"] for k in stops)
+            amb_a = sum(stat[k]["arr_amb"] for k in stops)
+            amb_d = sum(stat[k]["dep_amb"] for k in stops)
+            expected = n_trip * len(stops)
+            return dict(n_trip=n_trip, n_full=n_full, stat=stat, ev_arr=ev_arr, ev_dep=ev_dep, miss=miss,
+                        first_seen=first_seen, passes=passes, amb_a=amb_a, amb_d=amb_d, expected=expected)
+
+        r = judge(h0, h1)
+        if r is None:
             continue
-        passes = sum(stat[k]["arr_full"] + stat[k]["arr_ok"] + stat[k]["arr_amb"] for k in stops)
-        amb_a = sum(stat[k]["arr_amb"] for k in stops)
-        amb_d = sum(stat[k]["dep_amb"] for k in stops)
-        expected = n_trip * len(stops)
+        n_trip, n_full, stat, ev_arr, ev_dep, miss = (r[k] for k in ("n_trip", "n_full", "stat", "ev_arr", "ev_dep", "miss"))
+        first_seen, passes, amb_a, amb_d, expected = (r[k] for k in ("first_seen", "passes", "amb_a", "amb_d", "expected"))
         lines.append("")
         lines.append(f"- {label}({h0:02d}:00~{h1 - 1:02d}:59): 운행 {n_trip}회, 승차 구간에서 만석이 된 운행 {n_full}회"
                      f" ({n_full / n_trip * 100:.0f}%), 판정 애매 도착 {amb_a}/{passes} ({amb_a / passes * 100 if passes else 0:.1f}%)"
@@ -328,6 +345,27 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
         if first_seen:
             lines.append("  - 시간대 중간에 노선 앞부분을 건너뛰고 처음 잡힌 운행(중간 출발 후보): "
                          + ", ".join(f"{nm} {c}회" for nm, c in first_seen.most_common(3)))
+        if offday:  # 주말·공휴일: 2시간 구간별로 다시 판정한다
+            lines += ["", "  | 시간 | 운행 | 만석이 된 운행 | 판정 애매(도착 · 출발) | 만석 출발이 가장 많은 정류장 |",
+                      "  | --- | --- | --- | --- | --- |"]
+            for b0 in range(h0, h1, OFFDAY_BIN_H):
+                b1 = min(b0 + OFFDAY_BIN_H, h1)
+                b = judge(b0, b1)
+                span = f"{b0:02d}:00~{b1 - 1:02d}:59"
+                if b is None:
+                    got = any(t.strftime("%Y-%m-%d") == day and b0 * 60 <= t.hour * 60 + t.minute < b1 * 60 for t in polls)
+                    lines.append(f"  | {span} | {'0' if got else '수집 없음'} | - | - | - |")
+                    continue
+                bs = b["stat"]
+                best = max(stops, key=lambda k: (bs[k]["dep_full"], -k))
+                bn = bs[best]["arr_full"] + bs[best]["arr_ok"] + bs[best]["arr_amb"]
+                top_txt = f"{stations[best][0]} {bs[best]['dep_full']}/{bn}" if bs[best]["dep_full"] else "-"
+                bp = b["passes"]
+                lines.append(f"  | {span} | {b['n_trip']} | {b['n_full']} ({b['n_full'] / b['n_trip'] * 100:.0f}%)"
+                             f" | {b['amb_a'] / bp * 100 if bp else 0:.1f}% · {b['amb_d'] / bp * 100 if bp else 0:.1f}%"
+                             f" | {top_txt} |")
+            lines.append(f"  - 구간 경계({OFFDAY_BIN_H}시간)에 걸친 운행은 양쪽 구간에 모두 센다."
+                         " 아래 정류장 표는 하루 전체 기준")
         rows = []
         for k in stops:
             s = stat[k]
@@ -350,12 +388,21 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
     return lines
 
 
-def seat_section(paths: Paths, all_recs: dict, day: str) -> list[str]:
+def load_holidays(paths: Paths, day: str) -> set:
+    """collect.py가 받아 둔 공휴일 목록(YYYYMMDD). 파일이 없으면 빈 집합 → 토·일만 주말로 본다."""
+    return set(read_json(paths.state / f"holidays_{day[:4]}.json", None) or [])
+
+
+def seat_section(paths: Paths, all_recs: dict, day: str, offday: bool = False) -> list[str]:
     out = ["## 8. 빈자리(만석)", "",
            "승차 정류장마다 버스가 빈자리 0으로 도착한 비율(만석 도착)과 0으로 떠난 비율(만석 출발, 만석 도착 포함). "
            "만석 출발이 만석 도착보다 많은 정류장은 그 정류장에서 버스가 찬 것으로, 줄이 남았을 수 있다. "
            "같은 노선에서 기점에서 멀수록 높아지면 승차 기회 격차다. "
            "'판정 애매'는 호출 사이(1분)에 버스가 찬 경우로, 몇 % 안 되면 호출 간격은 충분하다.", ""]
+    if offday:
+        out += ["주말·공휴일이라 출근/퇴근 대신 방향별로 본다. 서울행 = 평일 출근과 같은 승차 정류장(회차 전·서울 밖), "
+                "귀가 = 평일 퇴근과 같은 승차 정류장(회차 후·서울 안). 하루 전체(06:00~21:59) 요약 뒤에 2시간 구간 표를 붙인다. "
+                "주말 호출 간격(2026-11-14 지침부터 2분)이 평일 1분보다 길어 '판정 애매'가 평일보다 높게 나올 수 있다.", ""]
     any_route = False
     for source in ("bus_gbis", "bus_seoul"):
         if source not in all_recs:
@@ -366,7 +413,7 @@ def seat_section(paths: Paths, all_recs: dict, day: str) -> list[str]:
             if ref is None:
                 out.append(f"- {route}: data/ref에 정류소 목록이 없어 건너뜀 (check_apis.py를 실행하면 생긴다)")
                 continue
-            out += seat_route_lines(route, trips_by_route[route], vcap[route], polls[route], ref, day) + [""]
+            out += seat_route_lines(route, trips_by_route[route], vcap[route], polls[route], ref, day, offday) + [""]
             any_route = True
     if not any_route:
         out.append("- 빈자리 자료 없음")
@@ -376,7 +423,8 @@ def seat_section(paths: Paths, all_recs: dict, day: str) -> list[str]:
 def build_report(base_dir: Path, day: str) -> str:
     paths = Paths(base_dir)
     files = day_files(paths.raw, day)
-    out = [f"# 수집 점검 {day}", ""]
+    offday = is_offday(datetime.strptime(day, "%Y-%m-%d"), load_holidays(paths, day))
+    out = [f"# 수집 점검 {day}" + (" (주말·공휴일)" if offday else ""), ""]
     if not files:
         out.append("이 날짜의 원본 파일이 없습니다.")
         return "\n".join(out)
@@ -469,7 +517,7 @@ def build_report(base_dir: Path, day: str) -> str:
     q = read_json(paths.state / f"quota_{day}.json", {})
     out += ["## 7. 오늘 호출 수 (한도 묶음별)", "", f"- {q}", ""]
     try:
-        out += seat_section(paths, all_recs, day)
+        out += seat_section(paths, all_recs, day, offday)
     except Exception as e:  # 빈자리 통계가 실패해도 나머지 점검표는 저장한다
         out += ["## 8. 빈자리(만석)", "", f"- 계산 중 오류로 건너뜀: {type(e).__name__}: {e}", ""]
     return "\n".join(out)
