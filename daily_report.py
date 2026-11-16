@@ -21,6 +21,10 @@
      (집계는 06:00~09:59에 지난 정류장만). 05:30 전 기록이 없는 날은 결과가 이전과 같다
      2026-11-14 보완: 토·일·공휴일은 출근/퇴근 대신 방향(서울행·귀가)별로 06:00~21:59 전체와 2시간 구간을 집계
      (공휴일은 collect.py가 저장한 data/state/holidays_YYYY.json 기준). 평일 결과는 이전과 같다
+     2026-11-17 보완(판정 애매 줄이기): ① 마지막 승차 정류장 바로 뒤가 서울 정류장이면(7770 출근 과천동)
+     '빈자리 있고 떠남'을 다음 정류장 관측으로 확인 ② 서울 API(9401)는 순번이 '마지막으로 지난 정류장'이라
+     그 정류장 구간 관측을 떠날 때 좌석으로, 앞 정류장 구간 관측을 도착 때 좌석으로 본다.
+     만석 도착·만석 출발 수는 바뀌지 않고 '애매'로 남던 통과만 '빈자리'로 판정된다
 """
 from __future__ import annotations
 
@@ -251,8 +255,13 @@ def max_run(events: list, key: str) -> int:
 
 
 def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day: str,
-                     offday: bool = False) -> list[str]:
+                     offday: bool = False, source: str = "bus_gbis") -> list[str]:
     turn, stations, nostop = ref
+    # 서울 API의 순번(sectOrd)은 '마지막으로 지난 정류장'이다(2026-11-16 원본: lastStnId 순번 = sectOrd, 10,565건 전부).
+    # 그래서 순번 k 관측의 좌석은 k를 떠난 뒤의 좌석이고, k-1 구간 관측의 좌석은 k에 도착할 때의 좌석이다.
+    # GBIS 순번은 버스가 있는 정류장이라 k 관측 중에도 승차가 이어질 수 있어 k 뒤의 관측으로 판정한다.
+    passed_seq = source == "bus_seoul"
+    real = sorted(k for k in stations if k not in nostop)
     lines = []
     cap_cnt = Counter(caps.values())
     lines.append(f"**{route}** — 차량 {len(caps)}대의 오늘 최대 빈자리(정원 추정): "
@@ -285,6 +294,12 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
             n_trip = n_full = 0
             for L in trips:
                 seg = [o for o in L if lo - 1 <= o[1] < nxt and in_win(o[0], LEAD_MIN)]
+                # 마지막 승차 정류장(hi)의 '빈자리 있고 떠남' 확인에만 다음 정류장(nxt) 관측을 쓴다(2026-11-17).
+                # hi 바로 뒤에 미정차 정류장이 없으면(7770 출근 과천동 → 남태령역) seg 안에 그 뒤 관측이 없어 전부 '애매'가 됐다.
+                # nxt는 하차 정류장이라 좌석이 다시 늘 수 있으므로 hi 말고 다른 정류장 판정에는 쓰지 않는다
+                # (hi와 nxt 사이에는 승차 정류장이 없어 hi에서 빈자리가 있었는지만 알려 준다).
+                # 만석 판정·만석 운행 집계는 seg 그대로 쓴다.
+                seg_ok = [o for o in L if lo - 1 <= o[1] <= nxt and in_win(o[0], LEAD_MIN)]
                 if len(seg) < 2 or not any(in_win(o[0]) for o in seg):
                     continue
                 n_trip += 1
@@ -310,10 +325,16 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
                     if before[-1][2] == 0:
                         arr, dep = "full", "full"
                     else:
-                        arr = "ok" if after[0][2] > 0 else "amb"
+                        prev_real = max([j for j in real if j < k] or [k - 1])
+                        if passed_seq and before[-1][1] >= prev_real:
+                            arr = "ok"  # 서울: 바로 앞 정류장을 떠난 뒤 좌석 > 0 = 빈자리 있게 도착
+                        else:
+                            arr = "ok" if after[0][2] > 0 else "amb"
                         if any(o[2] == 0 for o in after if o[1] < next_stop[k]):
                             dep = "full"
-                        elif any(o[2] > 0 for o in after if o[1] > k):
+                        elif any(o[2] > 0 for o in after if o[1] > k) or (
+                                passed_seq and any(o[2] > 0 for o in after if o[1] == k)) or (
+                                k == hi and any(o[2] > 0 for o in seg_ok if o[1] == nxt)):
                             dep = "ok"
                         else:
                             dep = "amb"
@@ -413,7 +434,8 @@ def seat_section(paths: Paths, all_recs: dict, day: str, offday: bool = False) -
             if ref is None:
                 out.append(f"- {route}: data/ref에 정류소 목록이 없어 건너뜀 (check_apis.py를 실행하면 생긴다)")
                 continue
-            out += seat_route_lines(route, trips_by_route[route], vcap[route], polls[route], ref, day, offday) + [""]
+            out += seat_route_lines(route, trips_by_route[route], vcap[route], polls[route], ref, day, offday,
+                                    source) + [""]
             any_route = True
     if not any_route:
         out.append("- 빈자리 자료 없음")
