@@ -78,6 +78,7 @@
 | --- | --- |
 | `collect.py` | 시간표대로 API를 호출해 원본 저장 (PC에 켜 두는 수집기) |
 | `daily_report.py` | 하루 수집 결과 점검표 |
+| `make_table.py` | '운행 1회 × 정류장' 표(CSV) 만들기. 열 설명은 [docs/TABLE.md](https://github.com/ido39203/gwangyeok-eta-pilot/blob/main/docs/TABLE.md) |
 | `check_apis.py` | 신청한 API를 한 번씩 호출해 점검표 작성, 노선 ID 찾기 |
 | `selftest.py` | 인터넷·키 없이 가짜 응답으로 전체 흐름 확인 |
 | `common.py`, `endpoints.py` | 공통 함수, API 주소 모음 |

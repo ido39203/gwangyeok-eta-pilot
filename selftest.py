@@ -248,6 +248,15 @@ def main() -> None:
         check("점검표: 도로공사 노선 목록(경부선) 표시", "0010 경부선" in rep)
         check("점검표: 공백 표시", "실행 중 멈춤" in rep)
 
+        # 3-1) '운행 1회 × 정류장' 표: 줄 수가 점검표 8절의 판정한 통과 수와 같아야 한다(2026-11-17)
+        import re
+        import make_table
+        trows = make_table.day_rows(base, day)
+        rep_passes = sum(int(m.group(1)) for m in re.finditer(r"판정 애매 도착 \d+/(\d+)", rep))
+        check("표: 줄 수 = 점검표의 판정한 통과 수", len(trows) == rep_passes, f"{len(trows)} vs {rep_passes}")
+        check("표: 판정 값과 정답 열이 맞음", all(r["arr"] in ("full", "ok", "amb") and r["full_dep"] == {"full": 1, "ok": 0, "amb": ""}[r["dep"]]
+                                            for r in trows))
+
         # 4) 다음 날: 지난 파일 압축, 도로공사 필터·중복 제거, 공휴일은 주말 시간표
         cfg2 = dict(cfg)
         cfg2["road_ex"] = dict(cfg["road_ex"], full_dump_days=1, keep_route_nos=["0010"])

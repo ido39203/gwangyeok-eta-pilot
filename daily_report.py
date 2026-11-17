@@ -27,6 +27,7 @@
      만석 도착·만석 출발 수는 바뀌지 않고 '애매'로 남던 통과만 '빈자리'로 판정된다
      2026-11-17 보완 2: 퇴근은 시간대 시작 60분 전(16:00) 기록까지 앞 정류장 판정에 쓴다(출근은 30분 그대로).
      config.yaml의 special_days에 있는 날은 제목에 '(특일)'과 이유를 붙인다
+     판정 결과를 한 건씩 받는 rows_out 인자는 make_table.py('운행 × 정류장' 표)가 쓴다. 점검표 결과는 바뀌지 않는다
 """
 from __future__ import annotations
 
@@ -201,8 +202,9 @@ def load_route_ref(ref_dir: Path, source: str, route: str):
     return turn, stations, nostop
 
 
-def seat_trips(source: str, recs: list[dict]):
-    """노선별 운행 목록(운행 = [(시각, 순번, 빈자리), ...]), 노선별 차량 최대 빈자리, 노선별 호출 시각."""
+def seat_trips(source: str, recs: list[dict], with_vehicle: bool = False):
+    """노선별 운행 목록(운행 = [(시각, 순번, 빈자리), ...]), 노선별 차량 최대 빈자리, 노선별 호출 시각.
+    with_vehicle=True면 노선별 운행 차량번호 목록(운행 목록과 같은 순서)을 네 번째로 돌려준다(make_table.py용)."""
     seat_f, seq_f, veh_f = SEAT_SOURCES[source]
     obs = defaultdict(list)
     vcap: dict = defaultdict(dict)
@@ -237,16 +239,21 @@ def seat_trips(source: str, recs: list[dict]):
                 route_caps[veh] = max(route_caps.get(veh, 0), seat)
             obs[(r.get("route", "?"), veh)].append((t, seq, seat))
     trips = defaultdict(list)
-    for (route, _veh), L in obs.items():
+    trip_veh = defaultdict(list)
+    for (route, veh), L in obs.items():
         L.sort()
         cur: list = []
         for o in L:
             if cur and (o[1] < cur[-1][1] - 1 or (o[0] - cur[-1][0]).total_seconds() > NEW_TRIP_GAP_SEC):
                 trips[route].append(cur)
+                trip_veh[route].append(veh)
                 cur = []
             cur.append(o)
         if cur:
             trips[route].append(cur)
+            trip_veh[route].append(veh)
+    if with_vehicle:
+        return trips, vcap, polls, trip_veh
     return trips, vcap, polls
 
 
@@ -259,7 +266,9 @@ def max_run(events: list, key: str) -> int:
 
 
 def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day: str,
-                     offday: bool = False, source: str = "bus_gbis") -> list[str]:
+                     offday: bool = False, source: str = "bus_gbis", rows_out: list | None = None) -> list[str]:
+    # rows_out에 리스트를 넘기면 시간대 전체 판정에서 판정한 통과를 한 건씩 dict로 담는다(make_table.py, 2026-11-17).
+    # 점검표 내용은 넘기든 안 넘기든 같다.
     turn, stations, nostop = ref
     # 서울 API의 순번(sectOrd)은 '마지막으로 지난 정류장'이다(2026-11-16 원본: lastStnId 순번 = sectOrd, 10,565건 전부).
     # 그래서 순번 k 관측의 좌석은 k를 떠난 뒤의 좌석이고, k-1 구간 관측의 좌석은 k에 도착할 때의 좌석이다.
@@ -283,7 +292,7 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
         lo, hi = stops[0], stops[-1]
         nxt = min([k for k in stations if k > hi and k not in nostop] or [hi + 1])
         next_stop = {k: (stops[i + 1] if i + 1 < len(stops) else nxt) for i, k in enumerate(stops)}
-        def judge(h0, h1):  # 시간대 [h0시, h1시) 안의 통과를 판정한다. 호출·운행이 없으면 None
+        def judge(h0, h1, record=False):  # 시간대 [h0시, h1시) 안의 통과를 판정한다. 호출·운행이 없으면 None
             def in_win(t, lead=0):  # 시간대 안(lead분 앞당김 허용)
                 m = t.hour * 60 + t.minute
                 return t.strftime("%Y-%m-%d") == day and h0 * 60 - lead <= m < h1 * 60
@@ -297,7 +306,7 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
             miss = Counter()
             first_seen = Counter()
             n_trip = n_full = 0
-            for L in trips:
+            for ti, L in enumerate(trips):
                 seg = [o for o in L if lo - 1 <= o[1] < nxt and in_win(o[0], lead)]
                 # 마지막 승차 정류장(hi)의 '빈자리 있고 떠남' 확인에만 다음 정류장(nxt) 관측을 쓴다(2026-11-17).
                 # hi 바로 뒤에 미정차 정류장이 없으면(7770 출근 과천동 → 남태령역) seg 안에 그 뒤 관측이 없어 전부 '애매'가 됐다.
@@ -312,7 +321,8 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
                     n_full += 1
                 at_start = (seg[0][0] - w0).total_seconds() <= EDGE_SEC
                 at_end = (w1 - seg[-1][0]).total_seconds() <= EDGE_SEC
-                if not at_start and seg[0][1] > stops[min(1, len(stops) - 1)]:
+                mid_start = not at_start and seg[0][1] > stops[min(1, len(stops) - 1)]
+                if mid_start:
                     k0 = max([x for x in stops if x <= seg[0][1]] or [seg[0][1]])
                     first_seen[stations.get(k0, ("?",))[0]] += 1
                 for k in stops:
@@ -345,6 +355,15 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
                             dep = "amb"
                     stat[k]["arr_" + arr] += 1
                     stat[k]["dep_" + dep] += 1
+                    if record:
+                        dep_obs = [o[2] for o in after if o[1] < next_stop[k]] or [None]
+                        rows_out.append(dict(
+                            route=route, period=label, trip=ti, stop_seq=k, stop_name=stations[k][0],
+                            stop_order=stops.index(k) + 1, n_stops=len(stops), pass_time=after[0][0],
+                            arr_seats=before[-1][2], dep_seats=min(x for x in dep_obs if x is not None)
+                            if any(x is not None for x in dep_obs) else None,
+                            arr=arr, dep=dep, mid_start=mid_start,
+                            trip_first_seq=seg[0][1], trip_first_time=seg[0][0]))
                     ev_arr[k].append((after[0][0], arr))
                     ev_dep[k].append((after[0][0], dep))
             if n_trip == 0:
@@ -356,7 +375,7 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
             return dict(n_trip=n_trip, n_full=n_full, stat=stat, ev_arr=ev_arr, ev_dep=ev_dep, miss=miss,
                         first_seen=first_seen, passes=passes, amb_a=amb_a, amb_d=amb_d, expected=expected)
 
-        r = judge(h0, h1)
+        r = judge(h0, h1, record=rows_out is not None)
         if r is None:
             continue
         n_trip, n_full, stat, ev_arr, ev_dep, miss = (r[k] for k in ("n_trip", "n_full", "stat", "ev_arr", "ev_dep", "miss"))
