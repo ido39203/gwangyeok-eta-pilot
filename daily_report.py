@@ -25,6 +25,8 @@
      '빈자리 있고 떠남'을 다음 정류장 관측으로 확인 ② 서울 API(9401)는 순번이 '마지막으로 지난 정류장'이라
      그 정류장 구간 관측을 떠날 때 좌석으로, 앞 정류장 구간 관측을 도착 때 좌석으로 본다.
      만석 도착·만석 출발 수는 바뀌지 않고 '애매'로 남던 통과만 '빈자리'로 판정된다
+     2026-11-17 보완 2: 퇴근은 시간대 시작 60분 전(16:00) 기록까지 앞 정류장 판정에 쓴다(출근은 30분 그대로).
+     config.yaml의 special_days에 있는 날은 제목에 '(특일)'과 이유를 붙인다
 """
 from __future__ import annotations
 
@@ -168,7 +170,9 @@ NOSTOP_WORDS = ("미정차", "(경유)", "(가상)")
 STALE_SEC = 180          # 서울 위치 자료(dataTm)가 이보다 오래되면 버린다
 NEW_TRIP_GAP_SEC = 1800  # 같은 차량이라도 이만큼 안 보이면 새 운행으로 본다
 EDGE_SEC = 300           # 시간대 첫/마지막 호출에서 이 안쪽이면 '시간대 경계에 걸린 운행'으로 본다
-LEAD_MIN = 30            # 시간대 시작 전 이만큼의 기록은 '앞 정류장' 판정에만 쓴다(2026-11-13 출근 수집 05:30 시작)
+# 시간대 시작 전 이만큼(분)의 기록은 '앞 정류장' 판정에만 쓴다.
+# 출근 30분(2026-11-13 출근 수집 05:30 시작), 퇴근 60분(2026-11-17 퇴근 수집 16:00 시작). 주말·공휴일은 수집 시작과 같아 의미 없음
+LEAD_MIN = {"출근": 30, "퇴근": 60}
 MAX_ROWS = 8             # 노선·시간대마다 표에 보일 정류장 수
 
 
@@ -268,6 +272,7 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
                  + ", ".join(f"{c}석 {n}대" for c, n in sorted(cap_cnt.items(), key=lambda x: (-x[1], -x[0]))[:4])
                  + "  ← 하루 동안 한 번도 빈 차로 잡히지 않은 차량은 실제 정원보다 작게 나온다")
     for label, h0, h1 in (OFFDAY_PERIODS if offday else PERIODS):
+        lead = LEAD_MIN.get(label, 30)
         if label in INBOUND:
             stops = sorted(k for k, (_, seoul) in stations.items() if k < turn and not seoul and k not in nostop)
         else:
@@ -282,7 +287,7 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
             def in_win(t, lead=0):  # 시간대 안(lead분 앞당김 허용)
                 m = t.hour * 60 + t.minute
                 return t.strftime("%Y-%m-%d") == day and h0 * 60 - lead <= m < h1 * 60
-            win = [t for t in polls if in_win(t, LEAD_MIN)]
+            win = [t for t in polls if in_win(t, lead)]
             if not any(in_win(t) for t in win):
                 return None
             w0, w1 = min(win), max(win)
@@ -293,13 +298,13 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
             first_seen = Counter()
             n_trip = n_full = 0
             for L in trips:
-                seg = [o for o in L if lo - 1 <= o[1] < nxt and in_win(o[0], LEAD_MIN)]
+                seg = [o for o in L if lo - 1 <= o[1] < nxt and in_win(o[0], lead)]
                 # 마지막 승차 정류장(hi)의 '빈자리 있고 떠남' 확인에만 다음 정류장(nxt) 관측을 쓴다(2026-11-17).
                 # hi 바로 뒤에 미정차 정류장이 없으면(7770 출근 과천동 → 남태령역) seg 안에 그 뒤 관측이 없어 전부 '애매'가 됐다.
                 # nxt는 하차 정류장이라 좌석이 다시 늘 수 있으므로 hi 말고 다른 정류장 판정에는 쓰지 않는다
                 # (hi와 nxt 사이에는 승차 정류장이 없어 hi에서 빈자리가 있었는지만 알려 준다).
                 # 만석 판정·만석 운행 집계는 seg 그대로 쓴다.
-                seg_ok = [o for o in L if lo - 1 <= o[1] <= nxt and in_win(o[0], LEAD_MIN)]
+                seg_ok = [o for o in L if lo - 1 <= o[1] <= nxt and in_win(o[0], lead)]
                 if len(seg) < 2 or not any(in_win(o[0]) for o in seg):
                     continue
                 n_trip += 1
@@ -409,6 +414,16 @@ def seat_route_lines(route: str, trips: list, caps: dict, polls: list, ref, day:
     return lines
 
 
+def load_special_days(base_dir: Path) -> dict:
+    """config.yaml의 special_days(날짜 → 이유). 평소와 다른 날이라 학습·비교 기준에서 빼는 날(2026-11-17 추가)."""
+    try:
+        import yaml
+        cfg = yaml.safe_load((Path(base_dir) / "config.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return {str(k): str(v) for k, v in (cfg.get("special_days") or {}).items()}
+
+
 def load_holidays(paths: Paths, day: str) -> set:
     """collect.py가 받아 둔 공휴일 목록(YYYYMMDD). 파일이 없으면 빈 집합 → 토·일만 주말로 본다."""
     return set(read_json(paths.state / f"holidays_{day[:4]}.json", None) or [])
@@ -446,7 +461,10 @@ def build_report(base_dir: Path, day: str) -> str:
     paths = Paths(base_dir)
     files = day_files(paths.raw, day)
     offday = is_offday(datetime.strptime(day, "%Y-%m-%d"), load_holidays(paths, day))
-    out = [f"# 수집 점검 {day}" + (" (주말·공휴일)" if offday else ""), ""]
+    special = load_special_days(base_dir).get(day)
+    out = [f"# 수집 점검 {day}" + (" (주말·공휴일)" if offday else "") + (" (특일)" if special else ""), ""]
+    if special:
+        out += [f"- 특일: {special}. 수집은 평소대로 하고, 이 날 기록은 모델 학습과 비교 기준(과거 기록)에서 뺀다.", ""]
     if not files:
         out.append("이 날짜의 원본 파일이 없습니다.")
         return "\n".join(out)
