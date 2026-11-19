@@ -9,7 +9,7 @@
   1. 작업별 호출 수와 성공률
   2. 버스: 노선·출처별로 잡힌 차량 수, 정류소 순번이 바뀐 횟수, 순번이 2칸 이상 건너뛴 비율
      → 건너뛴 비율이 높으면 호출 간격을 줄여야 한다
-  3. GBIS와 TAGO가 같은 시각에 같은 차량을 보여 주는지 (차량 일치율)
+  3. (2026-11-20 삭제) GBIS·TAGO 차량 일치율. TAGO 수집을 멈춰서 이 절은 더 만들지 않는다
   4. 도로공사: 갱신 주기(stdHour가 바뀌는 간격), 노선번호-노선명 목록 (keep_route_nos 고를 때 사용)
   5. 수집 공백, 오늘 호출 수
   6. 빈자리(만석): 승차 정류장마다 버스가 빈자리 0으로 도착한 비율, 0으로 떠난 비율, 만석이 된 운행 비율,
@@ -517,40 +517,13 @@ def build_report(base_dir: Path, day: str) -> str:
             "2칸 이상 건너뜀 비율이 높으면 그 사이 정류장 통과 시각을 놓친 것이다. 역행은 회차나 새 운행 시작.", "",
             "| 노선 | 호출 | 버스 잡힌 호출 | 차량 수 | 순번 변화 | 2칸 이상 건너뜀 | 역행 |", "| --- | --- | --- | --- | --- | --- | --- |"]
     sets_by_src = {}
-    for job in ("bus_gbis", "bus_tago", "bus_seoul"):
+    for job in ("bus_gbis", "bus_seoul"):
         if job in all_recs:
             out.append(f"| **{job}** | | | | | | |")
             lines, sets = bus_section(job, all_recs[job])
             out += lines
             sets_by_src[job] = sets
     out.append("")
-
-    if "bus_gbis" in sets_by_src and "bus_tago" in sets_by_src:
-        out += ["## 3. GBIS와 TAGO 비교 (같은 분에 둘 다 받은 경우)", "",
-                "| 노선 | 비교한 시각 수 | 차량 일치율 평균 | TAGO에만 있는 차량 비율 | TAGO 순번이 GBIS보다 뒤처진 비율 |",
-                "| --- | --- | --- | --- | --- |"]
-        g, t = sets_by_src["bus_gbis"], sets_by_src["bus_tago"]
-        for route in sorted(set(g) & set(t)):
-            common = sorted(set(g[route]) & set(t[route]))
-            jac, only_t = [], []
-            same = behind = 0
-            for m in common:
-                a, b = g[route][m], t[route][m]
-                ka, kb = set(a), set(b)
-                if ka or kb:
-                    jac.append(len(ka & kb) / len(ka | kb))
-                    only_t.append(len(kb - ka) / len(kb) if kb else 0)
-                for v in ka & kb:
-                    d = a[v] - b[v]
-                    same += d == 0
-                    behind += 0 < d <= 3
-            lag = f"{behind / (same + behind) * 100:.0f}%" if same + behind else "-"
-            if jac:
-                out.append(f"| {route} | {len(jac)} | {statistics.mean(jac) * 100:.0f}% | {statistics.mean(only_t) * 100:.0f}% | {lag} |")
-            else:
-                out.append(f"| {route} | 0 | - | - | - |")
-        out += ["", "TAGO 위치 응답에는 잔여좌석이 없다. 빈자리 수집은 GBIS가 맡고, 일치율이 90% 이상으로 꾸준하면"
-                " TAGO를 GBIS 장애 때의 위치 백업으로 쓸 수 있다.", ""]
 
     if "road_ex" in all_recs:
         out += ["## 4. 도로공사 실시간 소통", ""] + ex_section(all_recs["road_ex"]) + [""]

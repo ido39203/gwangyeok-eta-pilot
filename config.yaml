@@ -14,22 +14,13 @@ routes:
     gbis:
       keyword: "7770"
       route_id: ""
-    tago:                     # TAGO는 경기 시군만 있음. 앞에서부터 차례로 찾아본다.
-      city_codes: [31010]     # 31010 수원시
-      route_id: ""
   - name: "M5107"             # 국토부 광역급행 (경희대-서울역)
     gbis:
       keyword: "M5107"
       route_id: ""
-    tago:
-      city_codes: [31010, 31190]   # 수원시에서 안 나오면 용인시
-      route_id: ""
   - name: "M4101"             # 국토부 광역급행 (용인-숭례문) - 2026-11-10 추가
     gbis:
       keyword: "M4101"
-      route_id: ""
-    tago:
-      city_codes: [31190, 31010]   # 용인시에서 안 나오면 수원시
       route_id: ""
   - name: "9401"              # 서울 광역 (분당 구미동-서울역)
     # 2026-11-10 확인: 위치 응답의 congetion(도착 응답의 reride_Num, rerdie_Div=1)이 빈자리 수로 보임
@@ -58,7 +49,9 @@ routes:
 # ---------------------------------------------------------------
 # 2. 호출 시간표
 #    every_sec: 호출 간격(초). 호출 시각은 시계에 맞춰 정렬된다
-#    (예: 120초면 매 짝수 분 00초 근처). 그래서 GBIS와 TAGO를 같은 시각에 비교할 수 있다.
+#    (예: 120초면 매 짝수 분 00초 근처).
+#    2026-11-20 TAGO 버스위치 수집 중단(잔여좌석이 없고, 같은 PC에서 돌아 백업 역할을 못 함).
+#    11/10 ~ 11/20 TAGO 원본은 data/raw/bus_tago에 그대로 남아 있다.
 # ---------------------------------------------------------------
 schedules:
   # 경기 버스위치 (운영계정 하루 10,000건) - 7개 노선 기준 평일 4,410건, 주말 3,360건 (안전 한도 9,500건 안)
@@ -71,14 +64,6 @@ schedules:
     - {days: weekday, start: "05:30", end: "10:00", every_sec: 60}
     - {days: weekday, start: "16:00", end: "22:00", every_sec: 60}
     - {days: weekend, start: "06:00", end: "22:00", every_sec: 120}
-  # TAGO 버스위치 (하루 10,000건 한도) - 3개 노선 기준 평일 1,980건, 주말 1,710건
-  bus_tago:
-    - {days: weekday, start: "06:00", end: "10:00", every_sec: 60}
-    - {days: weekday, start: "17:00", end: "22:00", every_sec: 60}
-    - {days: weekday, start: "05:00", end: "06:00", every_sec: 300}
-    - {days: weekday, start: "10:00", end: "17:00", every_sec: 300}
-    - {days: weekday, start: "22:00", end: "24:00", every_sec: 300}
-    - {days: weekend, start: "05:00", end: "24:00", every_sec: 120}
   # 서울 버스위치 (운영계정 하루 10,000건) - 1개 노선 기준 평일 630건, 주말 480건
   # 2026-11-13 출근 시작 06:00 -> 05:30
   # 2026-11-14 주말·공휴일 08:00~21:59 3분 -> 06:00~21:59 2분
@@ -162,9 +147,6 @@ quota:
     seoul_buspos: 10000
     seoul_arrive: 1000
     seoul_station: 1000
-    tago_route: 10000
-    tago_buslc: 10000
-    tago_arvl: 10000
     kma_vilage: 10000
     kasi_spcde: 10000
     kma_asos: 10000

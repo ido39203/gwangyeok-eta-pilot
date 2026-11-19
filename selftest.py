@@ -192,8 +192,8 @@ def main() -> None:
         rows = chk.run()
         check_apis.print_table(rows)
         res = json.loads((base / "data/state/resolved_routes.json").read_text(encoding="utf-8"))
-        check("노선 찾기: 7770 GBIS·TAGO", res["7770"].get("gbis_route_id") == "234000026" and res["7770"].get("tago_route_id") == "GGB234000026")
-        check("노선 찾기: M5107은 수원에 없고 용인(31190)에서 찾음", res["M5107"].get("tago_city_code") == 31190)
+        check("노선 찾기: 7770 GBIS", res["7770"].get("gbis_route_id") == "234000026")
+        check("TAGO 노선은 찾지 않음(2026-11-20 TAGO 수집 중단)", all("tago_route_id" not in v for v in res.values()))
         check("노선 찾기: 9401 서울 busRouteId", res["9401"].get("seoul_route_id") == "100100589")
         check("ASOS 실패가 '실패'로 표시되고 메시지를 읽음", any(r["API"].startswith("기상청 ASOS") and r["결과"].startswith("실패") and "DENIED" in r["메시지"] for r in rows))
         check("공휴일 0건 달도 성공 처리", any(r["API"] == "천문연 특일정보" and r["결과"].startswith("성공") for r in rows))
@@ -214,16 +214,15 @@ def main() -> None:
                 ticks.append(t)
             t += timedelta(seconds=20)
         exp_gbis, gbis_every = expected_slots(cfg["schedules"]["bus_gbis"], ticks, False)
-        exp_tago = len({int(x.timestamp()) // 60 for x in ticks})
+        exp_1min = len({int(x.timestamp()) // 60 for x in ticks})
         exp_ex = len({int(x.timestamp()) // 300 for x in ticks})
         P = Paths(base)
         day = "2026-10-07"
-        recs = {j: list(read_jsonl(P.raw / j / f"{day}.jsonl")) for j in ["bus_gbis", "bus_tago", "bus_seoul", "road_ex", "weather", "seoul_link"]}
+        recs = {j: list(read_jsonl(P.raw / j / f"{day}.jsonl")) for j in ["bus_gbis", "bus_seoul", "road_ex", "weather", "seoul_link"]}
         g7770 = [r for r in recs["bus_gbis"] if r["route"] == "7770"]
         check(f"GBIS 7770 호출 수 = {gbis_every} 간격 슬롯 수(config 기준)", len(g7770) == exp_gbis, f"{len(g7770)} vs {exp_gbis}")
-        t7770 = [r for r in recs["bus_tago"] if r["route"] == "7770"]
-        check("TAGO 7770 호출 수 = 1분 간격 슬롯 수", len(t7770) == exp_tago, f"{len(t7770)} vs {exp_tago}")
-        check("서울 9401 호출 수 = 1분 간격 슬롯 수", len(recs["bus_seoul"]) == exp_tago, f"{len(recs['bus_seoul'])} vs {exp_tago}")
+        check("TAGO 호출 없음(2026-11-20 TAGO 수집 중단)", not (P.raw / "bus_tago").exists())
+        check("서울 9401 호출 수 = 1분 간격 슬롯 수", len(recs["bus_seoul"]) == exp_1min, f"{len(recs['bus_seoul'])} vs {exp_1min}")
         check("도로공사 호출 수 = 5분 간격 슬롯 수", len(recs["road_ex"]) == exp_ex, f"{len(recs['road_ex'])} vs {exp_ex}")
         check("도로공사 첫날은 전체 저장(full)", all(r["mode"] == "full" for r in recs["road_ex"]))
         npts = len({latlon_to_grid(p["lat"], p["lon"]) for p in cfg["weather_points"]})
@@ -244,7 +243,7 @@ def main() -> None:
         # 3) 하루 점검표
         rep = daily_report.build_report(base, day)
         (P.reports / f"daily_{day}.md").write_text(rep, encoding="utf-8")
-        check("점검표: GBIS-TAGO 비교 표 생성", "GBIS와 TAGO 비교" in rep)
+        check("점검표: GBIS-TAGO 비교 절 없음(TAGO 수집 중단)", "GBIS와 TAGO 비교" not in rep)
         check("점검표: 도로공사 노선 목록(경부선) 표시", "0010 경부선" in rep)
         check("점검표: 공백 표시", "실행 중 멈춤" in rep)
 
