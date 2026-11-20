@@ -53,7 +53,7 @@ def ymd(dt: datetime) -> str:
 # 설정과 인증키
 # ---------------------------------------------------------------------------
 def load_env(base_dir: Path = BASE_DIR) -> dict:
-    """.env 파일에서 인증키를 읽는다. 값이 비어 있으면 빈 문자열."""
+    """.env 파일에서 인증키와 감시 주소를 읽는다. 값이 비어 있으면 빈 문자열."""
     try:
         from dotenv import load_dotenv
 
@@ -64,6 +64,7 @@ def load_env(base_dir: Path = BASE_DIR) -> dict:
         "DATA_GO_KR_KEY": os.getenv("DATA_GO_KR_KEY", "").strip(),
         "EX_KEY": os.getenv("EX_KEY", "").strip(),
         "SEOUL_KEY": os.getenv("SEOUL_KEY", "").strip(),
+        "HC_PING_URL": os.getenv("HC_PING_URL", "").strip(),  # 멈춤 알림용 감시 주소(2026-11-20 추가, 없으면 알림 꺼짐)
     }
 
 

@@ -9,12 +9,16 @@
   data/logs/gaps.csv                  수집기가 꺼져 있었던 시간 (PC 절전·재부팅 등)
   data/state/quota_YYYY-MM-DD.json     API별 오늘 호출 수
 
+멈춤 알림(2026-11-20 추가): .env에 HC_PING_URL(healthchecks.io 감시 주소)을 넣으면 1분마다 '살아 있음' 신호를 보낸다.
+신호가 끊기면(PC 멈춤·꺼짐 포함) 감시 서비스가 메일을 보내고, 다시 들어오면 '재개' 메일을 보낸다. 없으면 알림만 꺼진다.
+
 먼저 check_apis.py를 한 번 실행해 노선 ID를 찾아 두어야 한다.
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -29,6 +33,87 @@ from common import (safe_console, BASE_DIR, DailyJsonlWriter, Http, Paths, Quota
 GAP_THRESHOLD_SEC = 180          # 이 이상 멈춰 있었으면 공백으로 기록
 HEARTBEAT_EVERY_SEC = 30
 SUMMARY_EVERY_SEC = 600
+PING_EVERY_SEC = 60              # 감시 서비스에 '살아 있음' 신호를 보내는 간격
+PING_CHECK_SEC = 5               # 신호 스레드가 보낼 때가 됐는지 보는 간격
+
+
+class Pinger:
+    """외부 감시(healthchecks.io)에 '살아 있음' 신호를 보낸다(2026-11-20 추가).
+
+    PC가 통째로 멈추면 수집기 스스로는 알릴 수 없으므로(2026-11-20 11:15 멈춤 사례), 바깥 감시 서비스가
+    신호가 끊긴 것을 보고 메일을 보낸다.
+    - 신호는 수집 루프가 실제로 돈 뒤(heartbeat)에만 보낸다. 루프가 멈췄는데 신호만 나가는 일이 없게.
+    - 보내기는 별도 스레드에서 하므로 인터넷이 느리거나 실패해도 수집에는 영향이 없다.
+    - Ctrl+C나 오류로 멈출 때는 /fail을 보내 기다리지 않고 바로 '멈춤' 알림이 가게 한다.
+    """
+
+    def __init__(self, url: str, send: Optional[Callable[[str, str], bool]] = None, every: int = PING_EVERY_SEC):
+        self.url = (url or "").strip().rstrip("/")
+        self.every = every
+        self.send = send or self._http_send
+        self._beat = threading.Event()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.last_sent = 0.0
+        self.fails = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+    @staticmethod
+    def _http_send(url: str, body: str) -> bool:
+        import requests
+
+        r = requests.post(url, data=body.encode("utf-8"), timeout=10)
+        return r.status_code == 200
+
+    def _post(self, suffix: str, body: str) -> bool:
+        try:
+            ok = bool(self.send(self.url + suffix, body))
+        except Exception:  # 인터넷 끊김 등. 수집은 계속한다
+            ok = False
+        if ok:
+            if self.fails:
+                logging.info("감시 신호 다시 성공 (연속 실패 %d회 뒤)", self.fails)
+            self.fails = 0
+        else:
+            self.fails += 1
+            if self.fails in (1, 10) or self.fails % 60 == 0:
+                logging.warning("감시 신호 보내기 실패 %d회째 (수집은 계속됨)", self.fails)
+        return ok
+
+    def beat(self) -> None:
+        """수집 루프가 한 번 돌았다는 표시. 다음 신호는 이 표시가 있을 때만 나간다."""
+        self._beat.set()
+
+    def step(self, t: float) -> bool:
+        """보낼 때가 됐으면 신호를 보낸다. 스레드가 PING_CHECK_SEC마다 부른다(시험에서는 직접 부름)."""
+        if self.enabled and self._beat.is_set() and t - self.last_sent >= self.every:
+            self._beat.clear()
+            self.last_sent = t
+            self._post("", "")
+            return True
+        return False
+
+    def start(self, msg: str) -> None:
+        if not self.enabled:
+            return
+        self._post("", msg)
+        self.last_sent = time.time()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="pinger", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(PING_CHECK_SEC):
+            self.step(time.time())
+
+    def stop(self, reason: str) -> None:
+        if not self.enabled:
+            return
+        self._stop.set()
+        self._post("/fail", reason)
 
 
 @dataclass
@@ -63,6 +148,7 @@ class Collector:
         self.last_summary = 0.0
         self.resolved = read_json(self.paths.state / "resolved_routes.json", {}) or {}
         self.jobs = self.build_jobs()
+        self.pinger = Pinger(self.env.get("HC_PING_URL", ""))
 
     # ------------------------------------------------------------------ 준비
     def route_ids(self, r: dict) -> dict:
@@ -295,6 +381,7 @@ class Collector:
         if force or t - self.last_heartbeat >= HEARTBEAT_EVERY_SEC:
             write_json(self.paths.state / "heartbeat.json", {"ts": now.isoformat(timespec="seconds")})
             self.last_heartbeat = t
+            self.pinger.beat()
 
     def on_new_day(self, now: datetime) -> None:
         today = ymd(now)
@@ -348,12 +435,22 @@ class Collector:
         now = self.clock()
         self.check_startup_gap(now)
         logging.info("수집 시작 (멈추려면 Ctrl+C)")
+        if self.pinger.enabled:
+            self.pinger.start(f"수집 시작 {now.isoformat(timespec='seconds')}")
+            logging.info("멈춤 알림 켜짐: %d초마다 감시 서비스에 신호를 보냅니다.", PING_EVERY_SEC)
+        else:
+            logging.info("멈춤 알림 꺼짐 (.env에 HC_PING_URL 없음)")
         try:
             while True:
                 self.tick()
                 time.sleep(max(0.2, 1.0 - (time.time() % 1.0)))
         except KeyboardInterrupt:
             logging.info("사용자가 수집을 멈췄습니다.")
+            self.pinger.stop("사용자가 수집을 멈춤(Ctrl+C)")
+        except Exception as e:
+            logging.exception("수집기 오류로 멈춤: %s", e)
+            self.pinger.stop(f"수집기 오류로 멈춤: {e}")
+            raise
         finally:
             self.heartbeat(self.clock(), force=True)
 

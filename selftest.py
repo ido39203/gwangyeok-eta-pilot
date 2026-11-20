@@ -256,6 +256,34 @@ def main() -> None:
         check("표: 판정 값과 정답 열이 맞음", all(r["arr"] in ("full", "ok", "amb") and r["full_dep"] == {"full": 1, "ok": 0, "amb": ""}[r["dep"]]
                                             for r in trows))
 
+        # 3-2) 시간대 제외(excluded_periods, 2026-11-20): 그 날 그 시간대는 표에서 빠지고 점검표에 안내가 붙는다
+        cfg_x = yaml.safe_load((base / "config.yaml").read_text(encoding="utf-8"))
+        cfg_x["excluded_periods"] = {day: {"출근": "시험용 공백"}}
+        (base / "config.yaml").write_text(yaml.safe_dump(cfg_x, allow_unicode=True), encoding="utf-8")
+        check("시간대 제외: 설정을 날짜·시간대별로 읽음", daily_report.load_excluded_periods(base) == {day: {"출근": "시험용 공백"}})
+        check("시간대 제외: 표에 그 시간대 줄이 없음", not any(r["period"] == "출근" for r in make_table.day_rows(base, day)))
+        rep_x = daily_report.build_report(base, day)
+        check("시간대 제외: 점검표 제목·안내 줄", "(출근 제외)" in rep_x.splitlines()[0] and "출근 제외: 시험용 공백" in rep_x)
+        make_base(base)  # 원래 설정으로 되돌림
+        check("시간대 제외: 설정이 없으면 빈 값", daily_report.load_excluded_periods(base).get(day, {}) == {})
+
+        # 3-3) 멈춤 알림 신호(Pinger, 2026-11-20): 루프가 돈 뒤에만, 60초 간격으로 보내고 멈출 때는 /fail
+        sent = []
+        pg = collect.Pinger("https://hc-ping.example/abc/", send=lambda u, b: sent.append((u, b)) or True)
+        first = pg.step(1000.0)          # 루프 표시가 없으면 보내지 않음
+        pg.beat()
+        second = pg.step(1000.0)
+        pg.beat()
+        third = pg.step(1030.0)          # 60초가 안 지나면 보내지 않음
+        fourth = pg.step(1061.0)
+        pg.stop("시험 멈춤")
+        check("알림 신호: 루프 표시가 있을 때 60초마다 보냄", (first, second, third, fourth) == (False, True, False, True), str((first, second, third, fourth)))
+        check("알림 신호: 멈출 때 /fail과 이유를 보냄", sent[-1] == ("https://hc-ping.example/abc/fail", "시험 멈춤"), str(sent[-1:]))
+        bad = collect.Pinger("https://hc-ping.example/abc", send=lambda u, b: 1 / 0)
+        bad.beat()
+        check("알림 신호: 보내기가 실패해도 오류 없이 넘어감", bad.step(1000.0) and bad.fails == 1)
+        check("알림 신호: HC_PING_URL이 없으면 꺼짐", not col.pinger.enabled and col.pinger._beat.is_set())
+
         # 4) 다음 날: 지난 파일 압축, 도로공사 필터·중복 제거, 공휴일은 주말 시간표
         cfg2 = dict(cfg)
         cfg2["road_ex"] = dict(cfg["road_ex"], full_dump_days=1, keep_route_nos=["0010"])

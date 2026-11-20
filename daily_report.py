@@ -27,6 +27,7 @@
      만석 도착·만석 출발 수는 바뀌지 않고 '애매'로 남던 통과만 '빈자리'로 판정된다
      2026-11-17 보완 2: 퇴근은 시간대 시작 60분 전(16:00) 기록까지 앞 정류장 판정에 쓴다(출근은 30분 그대로).
      config.yaml의 special_days에 있는 날은 제목에 '(특일)'과 이유를 붙인다
+     2026-11-20 보완: config.yaml의 excluded_periods에 있는 날·시간대는 제목에 '(퇴근 제외)'처럼 붙이고 이유를 적는다
      판정 결과를 한 건씩 받는 rows_out 인자는 make_table.py('운행 × 정류장' 표)가 쓴다. 점검표 결과는 바뀌지 않는다
 """
 from __future__ import annotations
@@ -443,6 +444,18 @@ def load_special_days(base_dir: Path) -> dict:
     return {str(k): str(v) for k, v in (cfg.get("special_days") or {}).items()}
 
 
+def load_excluded_periods(base_dir: Path) -> dict:
+    """config.yaml의 excluded_periods(날짜 → {시간대: 이유}). 수집 공백 등으로 그 날 한 시간대만
+    표·학습·비교 기준에서 빼는 경우(2026-11-20 추가). 시간대 이름은 평일 출근·퇴근, 주말·공휴일 서울행·귀가."""
+    try:
+        import yaml
+        cfg = yaml.safe_load((Path(base_dir) / "config.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return {str(d): {str(p): str(r) for p, r in (v or {}).items()}
+            for d, v in (cfg.get("excluded_periods") or {}).items()}
+
+
 def load_holidays(paths: Paths, day: str) -> set:
     """collect.py가 받아 둔 공휴일 목록(YYYYMMDD). 파일이 없으면 빈 집합 → 토·일만 주말로 본다."""
     return set(read_json(paths.state / f"holidays_{day[:4]}.json", None) or [])
@@ -481,9 +494,14 @@ def build_report(base_dir: Path, day: str) -> str:
     files = day_files(paths.raw, day)
     offday = is_offday(datetime.strptime(day, "%Y-%m-%d"), load_holidays(paths, day))
     special = load_special_days(base_dir).get(day)
-    out = [f"# 수집 점검 {day}" + (" (주말·공휴일)" if offday else "") + (" (특일)" if special else ""), ""]
+    excluded = load_excluded_periods(base_dir).get(day, {})
+    out = [f"# 수집 점검 {day}" + (" (주말·공휴일)" if offday else "") + (" (특일)" if special else "")
+           + (f" ({'·'.join(excluded)} 제외)" if excluded else ""), ""]
     if special:
         out += [f"- 특일: {special}. 수집은 평소대로 하고, 이 날 기록은 모델 학습과 비교 기준(과거 기록)에서 뺀다.", ""]
+    if excluded:
+        out += [f"- {p} 제외: {why}. 이 시간대 기록은 표(make_table.py)와 모델 학습·비교 기준에서 뺀다(원본은 그대로)."
+                for p, why in excluded.items()] + [""]
     if not files:
         out.append("이 날짜의 원본 파일이 없습니다.")
         return "\n".join(out)
