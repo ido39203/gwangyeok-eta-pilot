@@ -264,6 +264,24 @@ def main() -> None:
         check("시간대 제외: 표에 그 시간대 줄이 없음", not any(r["period"] == "출근" for r in make_table.day_rows(base, day)))
         rep_x = daily_report.build_report(base, day)
         check("시간대 제외: 점검표 제목·안내 줄", "(출근 제외)" in rep_x.splitlines()[0] and "출근 제외: 시험용 공백" in rep_x)
+
+        # 3-2-1) 시각 구간 제외(2026-11-27): from 이상 to 미만만 빼고, 형식이 틀리면 시간대 전체를 뺀다
+        cfg_x["excluded_periods"] = {day: {"출근": {"from": "08:00", "to": "09:30", "reason": "짧은 공백"},
+                                           "퇴근": {"from": "19:00", "to": "18:00", "reason": "뒤바뀜"}}}
+        (base / "config.yaml").write_text(yaml.safe_dump(cfg_x, allow_unicode=True), encoding="utf-8")
+        ex = daily_report.load_excluded(base).get(day, {})
+        check("시각 구간 제외: 시작·끝을 분으로 읽음", (ex["출근"]["from"], ex["출근"]["to"]) == (480, 570), str(ex.get("출근")))
+        check("시각 구간 제외: 경계(08:00 포함, 09:30 미포함)",
+              [daily_report.is_excluded(ex["출근"], m) for m in (479, 480, 569, 570)] == [False, True, True, False])
+        check("시각 구간 제외: 형식 오류면 시간대 전체", ex["퇴근"]["from"] is None and daily_report.is_excluded(ex["퇴근"], 1),
+              str(ex.get("퇴근")))
+        check("시각 구간 제외: 이유만 읽는 함수는 그대로", daily_report.load_excluded_periods(base)[day]["출근"] == "짧은 공백")
+        rep_w = daily_report.build_report(base, day)
+        check("시각 구간 제외: 점검표 제목·안내 줄",
+              "(출근 08:00 ~ 09:30·퇴근 제외)" in rep_w.splitlines()[0] and "출근 08:00 ~ 09:30 제외: 짧은 공백" in rep_w,
+              rep_w.splitlines()[0])
+        check("시각 구간 제외: 따옴표 없는 9:30(YAML이 570으로 읽음)도 받음", daily_report._hhmm_to_min(570) == 570
+              and daily_report._hhmm_to_min("9:30") == 570 and daily_report._hhmm_to_min("25:00") is None)
         make_base(base)  # 원래 설정으로 되돌림
         check("시간대 제외: 설정이 없으면 빈 값", daily_report.load_excluded_periods(base).get(day, {}) == {})
 

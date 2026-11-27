@@ -15,6 +15,7 @@
   data/tables/passes_all.csv          날짜별 표를 이어 붙인 전체 표(매번 다시 만든다)
 엑셀에서 한글이 깨지지 않도록 UTF-8(BOM)으로 저장한다. pandas는 encoding="utf-8-sig"로 읽는다.
 config.yaml의 excluded_periods에 적은 날·시간대(수집 공백 등)는 표에 넣지 않는다(2026-11-20 추가).
+시각 구간(from·to)을 적으면 그 시간대 중 통과 시각이 from 이상 to 미만인 줄만 뺀다(2026-11-27 추가).
 """
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ def day_rows(base_dir: Path, day: str) -> list[dict]:
     files = dr.day_files(paths.raw, day)
     offday = is_offday(datetime.strptime(day, "%Y-%m-%d"), dr.load_holidays(paths, day))
     special = dr.load_special_days(base_dir).get(day, "")
-    excluded = dr.load_excluded_periods(base_dir).get(day, {})  # 이 날 뺄 시간대(2026-11-20 추가)
+    excluded = dr.load_excluded(base_dir).get(day, {})  # 이 날 뺄 시간대(2026-11-20)·시각 구간(2026-11-27)
     day_type = "특일" if special else ("주말·공휴일" if offday else "평일")
     weekday = WEEKDAY_KO[datetime.strptime(day, "%Y-%m-%d").weekday()]
     out = []
@@ -60,10 +61,10 @@ def day_rows(base_dir: Path, day: str) -> list[dict]:
             dr.seat_route_lines(route, trips[route], vcap[route], polls[route], ref, day, offday, source,
                                 rows_out=rows)
             for r in rows:
-                if r["period"] in excluded:
+                t = r["pass_time"]
+                if dr.is_excluded(excluded.get(r["period"]), t.hour * 60 + t.minute):
                     continue
                 veh = trip_veh[route][r["trip"]]
-                t = r["pass_time"]
                 out.append({
                     "date": day, "weekday": weekday, "day_type": day_type, "special_note": special,
                     "source": source.replace("bus_", ""), "route": route, "period": r["period"],

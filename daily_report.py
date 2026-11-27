@@ -28,6 +28,7 @@
      2026-11-17 보완 2: 퇴근은 시간대 시작 60분 전(16:00) 기록까지 앞 정류장 판정에 쓴다(출근은 30분 그대로).
      config.yaml의 special_days에 있는 날은 제목에 '(특일)'과 이유를 붙인다
      2026-11-20 보완: config.yaml의 excluded_periods에 있는 날·시간대는 제목에 '(퇴근 제외)'처럼 붙이고 이유를 적는다
+     2026-11-27 보완: excluded_periods에 시각 구간(from·to)을 적으면 제목에 '(출근 08:00 ~ 09:30 제외)'처럼 붙인다
      판정 결과를 한 건씩 받는 rows_out 인자는 make_table.py('운행 × 정류장' 표)가 쓴다. 점검표 결과는 바뀌지 않는다
 """
 from __future__ import annotations
@@ -444,16 +445,66 @@ def load_special_days(base_dir: Path) -> dict:
     return {str(k): str(v) for k, v in (cfg.get("special_days") or {}).items()}
 
 
-def load_excluded_periods(base_dir: Path) -> dict:
-    """config.yaml의 excluded_periods(날짜 → {시간대: 이유}). 수집 공백 등으로 그 날 한 시간대만
-    표·학습·비교 기준에서 빼는 경우(2026-11-20 추가). 시간대 이름은 평일 출근·퇴근, 주말·공휴일 서울행·귀가."""
+def _hhmm_to_min(v) -> int | None:
+    """'08:00' → 480. YAML이 따옴표 없는 9:30을 570(분)으로 읽는 경우도 받는다. 형식이 틀리면 None."""
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v if 0 <= v <= 24 * 60 else None
+    try:
+        h, m = str(v).strip().split(":")
+        h, m = int(h), int(m)
+    except (ValueError, AttributeError):
+        return None
+    return h * 60 + m if 0 <= h <= 24 and 0 <= m < 60 and h * 60 + m <= 24 * 60 else None
+
+
+def _min_to_hhmm(m: int) -> str:
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def load_excluded(base_dir: Path) -> dict:
+    """config.yaml의 excluded_periods를 날짜 → {시간대: {"reason", "from", "to", "label"}}로 읽는다.
+    값이 문자열이면 그 시간대 전체(from·to None, 2026-11-20 방식).
+    값이 {from: "08:00", to: "09:30", reason: "..."}이면 그 시간대 안에서 통과 시각이 from 이상 to 미만인
+    기록만 뺀다(2026-11-27 추가). 시각 형식이 틀리면 안전하게 시간대 전체를 뺀다."""
     try:
         import yaml
         cfg = yaml.safe_load((Path(base_dir) / "config.yaml").read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
-    return {str(d): {str(p): str(r) for p, r in (v or {}).items()}
-            for d, v in (cfg.get("excluded_periods") or {}).items()}
+    out: dict = {}
+    for d, v in (cfg.get("excluded_periods") or {}).items():
+        day: dict = {}
+        for p, e in (v or {}).items():
+            p = str(p)
+            if isinstance(e, dict):
+                f, t = _hhmm_to_min(e.get("from")), _hhmm_to_min(e.get("to"))
+                reason = str(e.get("reason") or "")
+                if f is None or t is None or f >= t:
+                    day[p] = {"reason": reason + " (구간 형식 오류라 시간대 전체를 뺌)", "from": None, "to": None,
+                              "label": p}
+                else:
+                    day[p] = {"reason": reason, "from": f, "to": t,
+                              "label": f"{p} {_min_to_hhmm(f)} ~ {_min_to_hhmm(t)}"}
+            else:
+                day[p] = {"reason": str(e), "from": None, "to": None, "label": p}
+        out[str(d)] = day
+    return out
+
+
+def load_excluded_periods(base_dir: Path) -> dict:
+    """config.yaml의 excluded_periods(날짜 → {시간대: 이유}). 수집 공백 등으로 그 날 한 시간대(또는 그 안의
+    시각 구간)를 표·학습·비교 기준에서 빼는 경우(2026-11-20 추가, 시각 구간은 2026-11-27).
+    시간대 이름은 평일 출근·퇴근, 주말·공휴일 서울행·귀가. 구간 정보까지 필요하면 load_excluded를 쓴다."""
+    return {d: {p: e["reason"] for p, e in v.items()} for d, v in load_excluded(base_dir).items()}
+
+
+def is_excluded(entry: dict | None, pass_min: int) -> bool:
+    """load_excluded의 한 시간대 항목 기준으로 이 통과(자정부터 분)를 뺄지. 항목이 없으면 False."""
+    if not entry:
+        return False
+    if entry["from"] is None:
+        return True
+    return entry["from"] <= pass_min < entry["to"]
 
 
 def load_holidays(paths: Paths, day: str) -> set:
@@ -494,14 +545,16 @@ def build_report(base_dir: Path, day: str) -> str:
     files = day_files(paths.raw, day)
     offday = is_offday(datetime.strptime(day, "%Y-%m-%d"), load_holidays(paths, day))
     special = load_special_days(base_dir).get(day)
-    excluded = load_excluded_periods(base_dir).get(day, {})
+    excluded = load_excluded(base_dir).get(day, {})
     out = [f"# 수집 점검 {day}" + (" (주말·공휴일)" if offday else "") + (" (특일)" if special else "")
-           + (f" ({'·'.join(excluded)} 제외)" if excluded else ""), ""]
+           + (f" ({'·'.join(e['label'] for e in excluded.values())} 제외)" if excluded else ""), ""]
     if special:
         out += [f"- 특일: {special}. 수집은 평소대로 하고, 이 날 기록은 모델 학습과 비교 기준(과거 기록)에서 뺀다.", ""]
     if excluded:
-        out += [f"- {p} 제외: {why}. 이 시간대 기록은 표(make_table.py)와 모델 학습·비교 기준에서 뺀다(원본은 그대로)."
-                for p, why in excluded.items()] + [""]
+        out += [f"- {e['label']} 제외: {e['reason']}. "
+                + ("이 시간대 기록은" if e["from"] is None else "이 구간에 지난 통과 기록은")
+                + " 표(make_table.py)와 모델 학습·비교 기준에서 뺀다(원본은 그대로)."
+                for e in excluded.values()] + [""]
     if not files:
         out.append("이 날짜의 원본 파일이 없습니다.")
         return "\n".join(out)
